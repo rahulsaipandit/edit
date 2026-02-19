@@ -31,6 +31,29 @@ winget install Microsoft.Edit
 
 ### Build Configuration
 
+### Renaming the executable to msedit
+
+To avoid conflicts with existing commands, you can rename the executable to "msedit":
+
+1. Add the following to `[package]` section in `Cargo.toml`:
+   ```toml
+   [[bin]]
+   name = "msedit"
+   path = "src/bin/edit/main.rs"
+   ```
+
+2. Build the project:
+   ```sh
+   cargo build
+   ```
+
+3. Verify the rename worked by checking for the msedit binary:
+   ```sh
+   ls target/debug/msedit
+   # or for release builds:
+   ls target/release/msedit
+   ```
+
 During compilation you can set various environment variables to configure the build. The following table lists the available configuration options:
 
 Environment variable | Description
