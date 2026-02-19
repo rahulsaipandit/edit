@@ -1,5 +1,1 @@
-.idea
-.vs
-*.profraw
-lcov.info
-target
+.DS_Store

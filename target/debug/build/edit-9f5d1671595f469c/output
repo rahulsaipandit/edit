@@ -1,0 +1,10 @@
+cargo::rerun-if-env-changed=EDIT_CFG_ICUUC_SONAME
+cargo::rustc-env=EDIT_CFG_ICUUC_SONAME=libicucore.dylib
+cargo::rerun-if-env-changed=EDIT_CFG_ICUI18N_SONAME
+cargo::rustc-env=EDIT_CFG_ICUI18N_SONAME=libicucore.dylib
+cargo::rerun-if-env-changed=EDIT_CFG_ICU_EXPORT_PREFIX
+cargo::rustc-env=EDIT_CFG_ICU_EXPORT_PREFIX=
+cargo::rerun-if-env-changed=EDIT_CFG_ICU_EXPORT_SUFFIX
+cargo::rustc-env=EDIT_CFG_ICU_EXPORT_SUFFIX=
+cargo::rerun-if-env-changed=EDIT_CFG_ICU_RENAMING_AUTO_DETECT
+cargo::rustc-check-cfg=cfg(edit_icu_renaming_auto_detect)

@@ -102,3 +102,14 @@ To test your settings, run `cargo test` again but with the `--ignored` flag. For
 ```sh
 cargo test -- --ignored
 ```
+
+The line to prepend the release build folder to your PATH has been added to your ~/.zshrc:
+  echo 'export PATH="$HOME/Git/msedit/target/release:$PATH"' >> ~/.zshrc
+
+To make it effective right away, run:
+  source ~/.zshrc
+and then verify:
+  which msedit
+  msedit --version
+  
+From now on you’ll be able to invoke the release binary from anywhere.
