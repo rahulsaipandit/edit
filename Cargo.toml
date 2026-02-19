@@ -1,16 +1,24 @@
-[workspace]
-default-members = ["crates/edit"]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "edit"
+version = "1.2.1"
 edition = "2024"
-license = "MIT"
+rust-version = "1.87"
+readme = "README.md"
 repository = "https://github.com/microsoft/edit"
-rust-version = "1.93"
+homepage = "https://github.com/microsoft/edit"
+license = "MIT"
+categories = ["text-editors"]
+
 [[bin]]
 name = "msedit"
 path = "src/bin/edit/main.rs"
+
+[[bench]]
+name = "lib"
+harness = false
+
+[features]
+debug-latency = []
 
 # We use `opt-level = "s"` as it significantly reduces binary size.
 # We could then use the `#[optimize(speed)]` attribute for spot optimizations.
@@ -29,7 +37,30 @@ incremental = true          # Improves re-compile times
 codegen-units = 16          # Make compiling criterion faster (16 is the default, but profile.release sets it to 1)
 lto = "thin"                # Similarly, speed up linking by a ton
 
-[workspace.dependencies]
-edit = { path = "./crates/edit" }
-stdext = { path = "./crates/stdext" }
-unicode-gen = { path = "./crates/unicode-gen" }
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.22"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+]
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+zstd = { version = "0.13", default-features = false }
