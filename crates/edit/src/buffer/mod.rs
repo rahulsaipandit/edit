@@ -34,16 +34,16 @@ use std::rc::Rc;
 use std::str;
 
 pub use gap_buffer::GapBuffer;
-use stdext::arena::{Arena, scratch_arena};
-use stdext::collections::{BString, BVec};
-use stdext::unicode::Utf8Chars;
-use stdext::{ReplaceRange as _, arena_write_fmt, minmax, slice_as_uninit_mut, slice_copy_safe};
 
+use crate::arena::{Arena, arena_write_fmt, scratch_arena};
 use crate::cell::SemiRefCell;
 use crate::clipboard::Clipboard;
+use crate::collections::{BString, BVec};
 use crate::document::{ReadableDocument, WriteableDocument};
-use crate::framebuffer::{Framebuffer, IndexedColor};
+use crate::framebuffer::{Attributes, Framebuffer, IndexedColor};
 use crate::helpers::*;
+use crate::lsh::cache::HighlighterCache;
+use crate::lsh::{HighlightKind, Highlighter, Language};
 use crate::oklab::StraightRgba;
 use crate::simd::memchr2;
 use crate::unicode::{self, Cursor, MeasurementConfig};
@@ -52,13 +52,13 @@ use crate::{icu, simd};
 /// The margin template is used for line numbers.
 /// The max. line number we should ever expect is probably 64-bit,
 /// and so this template fits 19 digits, followed by " │ ".
-const MARGIN_TEMPLATE: &str = "                    │ ";
+const MARGIN_TEMPLATE: &[u8] = "                    │ ".as_bytes();
 /// Just a bunch of whitespace you can use for turning tabs into spaces.
 /// Happens to reuse MARGIN_TEMPLATE, because it has sufficient whitespace.
-const TAB_WHITESPACE: &str = MARGIN_TEMPLATE;
-const VISUAL_SPACE: &str = "･";
+const TAB_WHITESPACE: &[u8] = MARGIN_TEMPLATE;
+const VISUAL_SPACE: &[u8] = "･".as_bytes();
 const VISUAL_SPACE_PREFIX_ADD: usize = '･'.len_utf8() - 1;
-const VISUAL_TAB: &str = "￫       ";
+const VISUAL_TAB: &[u8] = "￫       ".as_bytes();
 const VISUAL_TAB_PREFIX_ADD: usize = '￫'.len_utf8() - 1;
 
 pub enum IoError {
@@ -200,12 +200,14 @@ struct ActiveEditGroupInfo {
 }
 
 /// Char- or word-wise navigation? Your choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
     Grapheme,
     Word,
 }
 
 /// See [`TextBuffer::move_selected_lines`].
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MoveLineDirection {
     Up,
     Down,
@@ -250,6 +252,7 @@ pub struct TextBuffer {
     selection: Option<TextBufferSelection>,
     selection_generation: u32,
     search: Option<UnsafeCell<ActiveSearch>>,
+    highlighter_cache: HighlighterCache,
 
     width: CoordType,
     margin_width: CoordType,
@@ -259,6 +262,7 @@ pub struct TextBuffer {
     tab_size: CoordType,
     indent_with_tabs: bool,
     line_highlight_enabled: bool,
+    language: Option<&'static Language>,
     ruler: CoordType,
     encoding: &'static str,
     newlines_are_crlf: bool,
@@ -298,6 +302,7 @@ impl TextBuffer {
             selection: None,
             selection_generation: 0,
             search: None,
+            highlighter_cache: HighlighterCache::new(),
 
             width: 0,
             margin_width: 0,
@@ -307,10 +312,11 @@ impl TextBuffer {
             tab_size: 4,
             indent_with_tabs: false,
             line_highlight_enabled: false,
+            language: None,
             ruler: 0,
             encoding: "UTF-8",
             newlines_are_crlf: cfg!(windows), // Windows users want CRLF
-            insert_final_newline: false,
+            insert_final_newline: false, // NOTE: Even with POSIX, single-line buffers need this to be false
             overtype: false,
 
             wants_cursor_visibility: false,
@@ -346,12 +352,14 @@ impl TextBuffer {
         self.buffer.generation()
     }
 
-    /// Force the buffer to be dirty.
+    /// Force the buffer to be dirty (needs to be saved to disk).
     pub fn mark_as_dirty(&mut self) {
         self.last_save_generation = self.buffer.generation().wrapping_sub(1);
     }
 
-    fn mark_as_clean(&mut self) {
+    /// Force the buffer to be clean (has been saved to disk).
+    /// Use this with caution. It's called automatically on write().
+    pub fn mark_as_clean(&mut self) {
         self.last_save_generation = self.buffer.generation();
     }
 
@@ -599,6 +607,15 @@ impl TextBuffer {
         self.line_highlight_enabled = enabled;
     }
 
+    pub fn language(&self) -> Option<&'static Language> {
+        self.language
+    }
+
+    pub fn set_language(&mut self, language: Option<&'static Language>) {
+        self.language = language;
+        self.highlighter_cache.invalidate_from(0);
+    }
+
     /// Sets a ruler column, e.g. 80.
     pub fn set_ruler(&mut self, column: CoordType) {
         self.ruler = column;
@@ -677,6 +694,7 @@ impl TextBuffer {
         self.set_selection(None);
         self.mark_as_clean();
         self.reflow();
+        self.highlighter_cache.invalidate_from(0);
     }
 
     /// Copies the contents of the buffer into a string.
@@ -836,6 +854,23 @@ impl TextBuffer {
         first_chunk_len: usize,
         done: bool,
     ) -> io::Result<()> {
+        // Get the length of the file. 0 = not a file.
+        let file_len = if done {
+            // But if the first 4KiB read already contains the entire file, we won't need
+            // the file length below (we early return). The value here doesn't matter.
+            0
+        } else {
+            // We can't acquire the length on pipes, for instance.
+            file.metadata().ok().and_then(|m| m.len().try_into().ok()).unwrap_or(0)
+        };
+
+        // If we have a file length, reserve enough space for it.
+        // The call is a no-op for small files (currently <4GiB).
+        if file_len > 0 {
+            self.buffer.try_reserve(file_len);
+        }
+
+        // Handle the first chunk we already read for encoding detection.
         {
             let mut first_chunk = unsafe { buf[..first_chunk_len].assume_init_ref() };
             if first_chunk.starts_with(b"\xEF\xBB\xBF") {
@@ -845,27 +880,22 @@ impl TextBuffer {
 
             self.buffer.replace(0..0, first_chunk);
         }
-
         if done {
             return Ok(());
         }
 
-        // If we don't have file metadata, the input may be a pipe or a socket.
-        // Every read will have the same size until we hit the end.
-        let mut chunk_size = 128 * KIBI;
-        let mut extra_chunk_size = 128 * KIBI;
-
-        if let Ok(m) = file.metadata() {
-            // Usually the next read of size `chunk_size` will read the entire file,
-            // but if the size has changed for some reason, then `extra_chunk_size`
-            // should be large enough to read the rest of the file.
-            // 4KiB is not too large and not too slow.
-            let len = m.len() as usize;
-            chunk_size = len.saturating_sub(first_chunk_len);
-            extra_chunk_size = 4 * KIBI;
-        }
-
         loop {
+            let chunk_size = if file_len > 0 {
+                // If we know the file length:
+                // * Read the file until the end
+                // * And if we're still reading at that point, read in 4KiB chunks (e.g. if someone wrote
+                //   to the file concurrently; typically this won't happen, so the chunk size is small).
+                file_len.checked_sub(self.text_length()).unwrap_or(4 * KIBI)
+            } else {
+                // For pipes, sockets, etc., read in 128KiB chunks, because anything smaller has poor perf.
+                128 * KIBI
+            };
+
             let gap = self.buffer.allocate_gap(self.text_length(), chunk_size, 0);
             if gap.is_empty() {
                 break;
@@ -877,7 +907,6 @@ impl TextBuffer {
             }
 
             self.buffer.commit_gap(read);
-            chunk_size = extra_chunk_size;
         }
 
         Ok(())
@@ -1134,15 +1163,15 @@ impl TextBuffer {
 
         // If the user moved the cursor since the last search, but the needle remained the same,
         // we still need to move the start of the search to the new cursor position.
-        let next_search_offset = match self.selection {
-            Some(TextBufferSelection { beg, end }) => {
-                if self.selection_generation == search.selection_generation {
-                    search.next_search_offset
-                } else {
+        let next_search_offset = if self.selection_generation == search.selection_generation {
+            search.next_search_offset
+        } else {
+            match self.selection {
+                Some(TextBufferSelection { beg, end }) => {
                     self.cursor_move_to_logical_internal(self.cursor, beg.min(end)).offset
                 }
+                _ => self.cursor.offset,
             }
-            _ => self.cursor.offset,
         };
 
         self.find_select_next(search, next_search_offset, true);
@@ -1157,15 +1186,23 @@ impl TextBuffer {
         replacement: &[u8],
     ) -> icu::Result<()> {
         // Editors traditionally replace the previous search hit, not the next possible one.
-        if let (Some(search), Some(..)) = (&self.search, &self.selection) {
+        if let Some(search) = &self.search {
             let search = unsafe { &mut *search.get() };
             if search.selection_generation == self.selection_generation {
                 let scratch = scratch_arena(None);
+                let zero_width = self.selection.is_none();
                 let parsed_replacements =
                     Self::find_parse_replacement(&scratch, &mut *search, replacement);
                 let replacement =
                     self.find_fill_replacement(&mut *search, replacement, &parsed_replacements);
-                self.write(&replacement, self.cursor, true);
+                self.write_raw(&replacement);
+
+                // After replacing a zero-width match, advance past it so that find_and_select wraps to the
+                // next match rather than finding the same anchor (e.g. `$`) again at the same line end.
+                if zero_width {
+                    search.next_search_offset =
+                        self.find_advance_past_zero_width(self.active_edit_off).unwrap_or(0);
+                }
             }
         }
 
@@ -1179,24 +1216,46 @@ impl TextBuffer {
         options: SearchOptions,
         replacement: &[u8],
     ) -> icu::Result<()> {
+        self.edit_begin_grouping();
+
         let scratch = scratch_arena(None);
         let mut search = self.find_construct_search(pattern, options)?;
         let mut offset = 0;
         let parsed_replacements = Self::find_parse_replacement(&scratch, &mut search, replacement);
 
-        loop {
-            self.find_select_next(&mut search, offset, false);
-            if !self.has_selection() {
-                break;
-            }
-
+        while let Some(range) = self.find_select_next(&mut search, offset, false) {
             let replacement =
                 self.find_fill_replacement(&mut search, replacement, &parsed_replacements);
-            self.write(&replacement, self.cursor, true);
-            offset = self.cursor.offset;
+            self.write_raw(&replacement);
+
+            // The `active_edit_off` points to the end of the last edit made by `write_raw()`.
+            // This differs from the self.cursor.offset, if `write_raw()` did an `insert_final_newline`.
+            offset = self.active_edit_off;
+
+            // Avoid infinite loops when hitting zero-length matches
+            // by advancing past the zero-length match location.
+            //
+            // This is technically not entirely correct. For instance imagine replacing
+            // "^|f" with "x" in "foo". It should technically produce "xxoo", but I
+            // found that other editors also do it wrong, so it can't matter too much.
+            if range.is_empty() {
+                offset = match self.find_advance_past_zero_width(offset) {
+                    Some(next) => next,
+                    None => break,
+                };
+            }
         }
 
+        self.edit_end_grouping();
         Ok(())
+    }
+
+    /// After replacing a zero-width match, compute the offset to resume
+    /// searching from. Returns `None` if we're at the end of the buffer.
+    fn find_advance_past_zero_width(&self, offset: usize) -> Option<usize> {
+        let cursor = self.cursor_move_to_offset_internal(self.cursor, offset);
+        let next = self.cursor_move_delta_internal(cursor, CursorMovement::Grapheme, 1);
+        (next.offset > offset).then_some(next.offset)
     }
 
     fn find_construct_search(
@@ -1259,7 +1318,12 @@ impl TextBuffer {
         })
     }
 
-    fn find_select_next(&mut self, search: &mut ActiveSearch, offset: usize, wrap: bool) {
+    fn find_select_next(
+        &mut self,
+        search: &mut ActiveSearch,
+        offset: usize,
+        wrap: bool,
+    ) -> Option<Range<usize>> {
         if search.buffer_generation != self.buffer.generation() {
             unsafe { search.regex.set_text(&mut search.text, offset) };
             search.buffer_generation = self.buffer.generation();
@@ -1279,7 +1343,7 @@ impl TextBuffer {
             hit = search.regex.next();
         }
 
-        search.selection_generation = if let Some(range) = hit {
+        search.selection_generation = if let Some(range) = &hit {
             // Now the search offset is no more at the start of the buffer.
             search.next_search_offset = range.end;
 
@@ -1298,6 +1362,8 @@ impl TextBuffer {
             search.no_matches = true;
             self.set_selection(None)
         };
+
+        hit
     }
 
     fn find_parse_replacement<'a>(
@@ -1707,16 +1773,14 @@ impl TextBuffer {
     }
 
     fn set_cursor_internal(&mut self, cursor: Cursor) {
-        debug_assert!(
-            cursor.offset <= self.text_length()
-                && cursor.logical_pos.x >= 0
-                && cursor.logical_pos.y >= 0
-                && cursor.logical_pos.y <= self.stats.logical_lines
-                && cursor.visual_pos.x >= 0
-                && (self.word_wrap_column <= 0 || cursor.visual_pos.x <= self.word_wrap_column)
-                && cursor.visual_pos.y >= 0
-                && cursor.visual_pos.y <= self.stats.visual_lines
-        );
+        debug_assert!(cursor.offset <= self.text_length());
+        debug_assert!(cursor.logical_pos.x >= 0);
+        debug_assert!(cursor.logical_pos.y >= 0);
+        debug_assert!(cursor.logical_pos.y <= self.stats.logical_lines);
+        debug_assert!(cursor.visual_pos.x >= 0);
+        debug_assert!(self.word_wrap_column <= 0 || cursor.visual_pos.x <= self.word_wrap_column);
+        debug_assert!(cursor.visual_pos.y >= 0);
+        debug_assert!(cursor.visual_pos.y <= self.stats.visual_lines);
         self.cursor = cursor;
     }
 
@@ -1738,7 +1802,6 @@ impl TextBuffer {
         let height = destination.height();
         let line_number_width = self.margin_width.max(3) as usize - 3;
         let text_width = width - self.margin_width;
-        let mut visualizer_buf = [0xE2, 0x90, 0x80]; // U+2400 in UTF8
         let mut visual_pos_x_max = 0;
 
         // Pick the cursor closer to the `origin.y`.
@@ -1757,7 +1820,7 @@ impl TextBuffer {
 
         for y in 0..height {
             let scratch = scratch_arena(None);
-            let mut line = BString::empty();
+            let mut line = BVec::empty();
             line.reserve(&*scratch, width as usize * 2);
 
             let visual_line = origin.y + y;
@@ -1781,7 +1844,7 @@ impl TextBuffer {
                     // because `line_number_width` can't possibly be larger than 19.
                     let off = 19 - line_number_width;
                     unsafe { std::hint::assert_unchecked(off < MARGIN_TEMPLATE.len()) };
-                    line.push_str(&*scratch, &MARGIN_TEMPLATE[off..]);
+                    line.extend_from_slice(&*scratch, &MARGIN_TEMPLATE[off..]);
                 } else if self.word_wrap_column <= 0 || cursor_beg.logical_pos.x == 0 {
                     // Regular line? Place "123 | " in the margin.
                     arena_write_fmt!(
@@ -1886,7 +1949,7 @@ impl TextBuffer {
                     if cursor_next.visual_pos.x > origin.x {
                         let overlap = cursor_next.visual_pos.x - origin.x;
                         debug_assert!((1..=7).contains(&overlap));
-                        line.push_str(&*scratch, &TAB_WHITESPACE[..overlap as usize]);
+                        line.extend_from_slice(&*scratch, &TAB_WHITESPACE[..overlap as usize]);
                         cursor_beg = cursor_next;
                     }
                 }
@@ -1897,19 +1960,19 @@ impl TextBuffer {
                 while global_off < cursor_end.offset {
                     let chunk = self.read_forward(global_off);
                     let chunk = &chunk[..chunk.len().min(cursor_end.offset - global_off)];
-                    let mut it = Utf8Chars::new(chunk, 0);
+                    let mut off = 0;
 
-                    // TODO: Looping char-by-char is bad for performance.
-                    // >25% of the total rendering time is spent here.
-                    loop {
-                        let chunk_off = it.offset();
-                        let global_off = global_off + chunk_off;
-                        let Some(ch) = it.next() else {
-                            break;
-                        };
+                    while off < chunk.len() {
+                        let beg = off;
+                        off = memchr2(b' ', b'\t', chunk, off);
 
-                        if ch == ' ' || ch == '\t' {
-                            let is_tab = ch == '\t';
+                        // Anything that isn't whitespace is copied as-is.
+                        // The framebuffer takes care of sanitizing it.
+                        line.extend_from_slice(&*scratch, &chunk[beg..off]);
+
+                        while off < chunk.len() && matches!(chunk[off], b' ' | b'\t') {
+                            let is_tab = chunk[off] == b'\t';
+                            let global_off = global_off + off;
                             let visualize = selection_off.contains(&global_off);
                             let mut whitespace = TAB_WHITESPACE;
                             let mut prefix_add = 0;
@@ -1917,7 +1980,7 @@ impl TextBuffer {
                             if is_tab || visualize {
                                 // We need the character's visual position in order to either compute the tab size,
                                 // or set the foreground color of the visualizer, respectively.
-                                // TODO: Doing this char-by-char is of course also bad for performance.
+                                // TODO: Doing this char-by-char is bad for performance.
                                 cursor_line =
                                     self.cursor_move_to_offset_internal(cursor_line, global_off);
                             }
@@ -1949,38 +2012,11 @@ impl TextBuffer {
                                 );
                             }
 
-                            line.push_str(&*scratch, &whitespace[..prefix_add + tab_size as usize]);
-                        } else if ch <= '\x1f' || ('\u{7f}'..='\u{9f}').contains(&ch) {
-                            // Append a Unicode representation of the C0 or C1 control character.
-                            visualizer_buf[2] = if ch <= '\x1f' {
-                                0x80 | ch as u8 // U+2400..=U+241F
-                            } else if ch == '\x7f' {
-                                0xA1 // U+2421
-                            } else {
-                                0xA6 // U+2426, because there are no pictures for C1 control characters.
-                            };
-
-                            // Our manually constructed UTF8 is never going to be invalid. Trust.
-                            line.push_str(&*scratch, unsafe {
-                                str::from_utf8_unchecked(&visualizer_buf)
-                            });
-
-                            // Highlight the control character yellow.
-                            cursor_line =
-                                self.cursor_move_to_offset_internal(cursor_line, global_off);
-                            let visualizer_rect = {
-                                let left =
-                                    destination.left + self.margin_width + cursor_line.visual_pos.x
-                                        - origin.x;
-                                let top = destination.top + cursor_line.visual_pos.y - origin.y;
-                                Rect { left, top, right: left + 1, bottom: top + 1 }
-                            };
-                            let bg = fb.indexed(IndexedColor::Yellow);
-                            let fg = fb.contrasted(bg);
-                            fb.blend_bg(visualizer_rect, bg);
-                            fb.blend_fg(visualizer_rect, fg);
-                        } else {
-                            line.push(&*scratch, ch);
+                            line.extend_from_slice(
+                                &*scratch,
+                                &whitespace[..prefix_add + tab_size as usize],
+                            );
+                            off += 1;
                         }
                     }
 
@@ -1995,6 +2031,10 @@ impl TextBuffer {
             cursor = cursor_end;
         }
 
+        let logical_y_beg = self.cursor_for_rendering.unwrap().logical_pos.y;
+        let logical_y_end = cursor.logical_pos.y + 1;
+        self.render_apply_highlights(origin, destination, logical_y_beg..logical_y_end, fb);
+
         // Colorize the margin that we wrote above.
         if self.margin_width > 0 {
             let margin = Rect {
@@ -2003,7 +2043,7 @@ impl TextBuffer {
                 right: destination.left + self.margin_width,
                 bottom: destination.bottom,
             };
-            fb.blend_fg(margin, StraightRgba::from_le(0x7f7f7f7f));
+            fb.blend_fg(margin, StraightRgba::from_rgba(0x7f7f7f7f));
         }
 
         if self.ruler > 0 {
@@ -2051,13 +2091,163 @@ impl TextBuffer {
                             right: destination.right,
                             bottom: cursor.y + 1,
                         },
-                        StraightRgba::from_le(0x7f7f7f7f),
+                        StraightRgba::from_rgba(0x7f7f7f7f),
                     );
                 }
             }
         }
 
         Some(RenderResult { visual_pos_x_max })
+    }
+
+    fn render_apply_highlights(
+        &mut self,
+        origin: Point,
+        destination: Rect,
+        logical_y_range: Range<CoordType>,
+        fb: &mut Framebuffer,
+    ) {
+        let Some(language) = self.language else {
+            return;
+        };
+
+        let mut highlighter = Highlighter::new(&self.buffer, language);
+
+        // Track cursor position for efficient offset-to-position conversions.
+        // Start from the rendering cursor which is at the beginning of the visible area.
+        let mut cursor = self.cursor_for_rendering.unwrap();
+
+        // Visible vertical range in visual coordinates.
+        let visible_top = origin.y;
+        let visible_bottom = origin.y + destination.height();
+
+        // Text area boundaries in screen coordinates (excluding margin).
+        let text_left = destination.left + self.margin_width;
+        let text_right = destination.right;
+
+        for logical_y in logical_y_range {
+            // Seek cursor to the start of this logical line for efficient lookups.
+            // This is important because highlights are sorted by offset within
+            // each logical line.
+            cursor = self.goto_line_start(cursor, logical_y);
+
+            let scratch = scratch_arena(None);
+            let highlights =
+                self.highlighter_cache.parse_line(&scratch, &mut highlighter, logical_y);
+
+            for pair in highlights.windows(2) {
+                let curr = &pair[0];
+                let next = &pair[1];
+
+                // Skip highlights with no visual effect.
+                if curr.kind == HighlightKind::Other {
+                    continue;
+                }
+
+                // Convert byte offsets to cursor positions. Since highlights are
+                // sorted by offset, we chain from cursor -> beg -> end for efficiency.
+                let beg = self.cursor_move_to_offset_internal(cursor, curr.start);
+                let end = self.cursor_move_to_offset_internal(beg, next.start);
+                cursor = end;
+
+                let color = match curr.kind {
+                    HighlightKind::Other => None,
+                    HighlightKind::Comment => Some(IndexedColor::Green),
+                    HighlightKind::Method => Some(IndexedColor::BrightYellow),
+                    HighlightKind::String => Some(IndexedColor::BrightRed),
+                    HighlightKind::Variable => Some(IndexedColor::BrightCyan),
+                    HighlightKind::ConstantLanguage => Some(IndexedColor::BrightBlue),
+                    HighlightKind::ConstantNumeric => Some(IndexedColor::BrightGreen),
+                    HighlightKind::KeywordControl => Some(IndexedColor::BrightMagenta),
+                    HighlightKind::KeywordOther => Some(IndexedColor::BrightBlue),
+                    HighlightKind::KeywordPreprocessor => Some(IndexedColor::BrightBlue),
+                    HighlightKind::MarkupBold => None,
+                    HighlightKind::MarkupChanged => Some(IndexedColor::BrightBlue),
+                    HighlightKind::MarkupDeleted => Some(IndexedColor::BrightRed),
+                    HighlightKind::MarkupHeading => Some(IndexedColor::BrightBlue),
+                    HighlightKind::MarkupInserted => Some(IndexedColor::BrightGreen),
+                    HighlightKind::MarkupItalic => None,
+                    HighlightKind::MarkupLink => None,
+                    HighlightKind::MarkupList => Some(IndexedColor::BrightBlue),
+                    HighlightKind::MarkupStrikethrough => None,
+                    HighlightKind::MetaHeader => Some(IndexedColor::BrightBlue),
+                    HighlightKind::StorageAnnotation => Some(IndexedColor::Cyan),
+                    HighlightKind::StorageType => Some(IndexedColor::Cyan),
+                };
+                let attr = match curr.kind {
+                    HighlightKind::MarkupBold => Some(Attributes::Bold),
+                    HighlightKind::MarkupItalic => Some(Attributes::Italic),
+                    HighlightKind::MarkupLink => Some(Attributes::Underlined),
+                    HighlightKind::MarkupStrikethrough => Some(Attributes::Strikethrough),
+                    _ => None,
+                };
+
+                // Handle the case where the highlight spans multiple visual lines
+                // due to word wrapping. The range is [beg, end) in terms of offsets,
+                // which maps to visual lines [beg.visual_pos.y, end.visual_pos.y].
+                //
+                // When beg and end are on the same visual line, we highlight
+                // [beg.visual_pos.x, end.visual_pos.x).
+                //
+                // When they span multiple lines:
+                // - First line: [beg.visual_pos.x, end_of_line)
+                // - Middle lines: [0, end_of_line)
+                // - Last line: [0, end.visual_pos.x)
+                //
+                // However, if end.visual_pos.x == 0, the last line has no content
+                // to highlight (the span ends exactly at the line boundary).
+                let visual_y_end = if end.visual_pos.x == 0 && end.visual_pos.y > beg.visual_pos.y {
+                    // The span ends at position 0 of a new visual line, meaning
+                    // it actually ends at the end of the previous visual line.
+                    end.visual_pos.y - 1
+                } else {
+                    end.visual_pos.y
+                };
+
+                // Use min/max to skip visual lines outside the visible vertical range.
+                for visual_y in
+                    beg.visual_pos.y.max(visible_top)..(visual_y_end + 1).min(visible_bottom)
+                {
+                    let vis_left = if visual_y == beg.visual_pos.y {
+                        beg.visual_pos.x
+                    } else {
+                        // Wrapped continuation lines start at visual x=0.
+                        0
+                    };
+                    let vis_right = if visual_y == end.visual_pos.y {
+                        end.visual_pos.x
+                    } else {
+                        // Line extends to the word wrap column or beyond.
+                        COORD_TYPE_SAFE_MAX
+                    };
+
+                    // Convert to screen coordinates.
+                    let screen_left = text_left + vis_left - origin.x;
+                    let screen_right = (text_left + vis_right - origin.x).min(text_right);
+                    let screen_y = destination.top + visual_y - origin.y;
+
+                    // Create the target rectangle, clamped to the text area.
+                    let rect = Rect {
+                        left: screen_left.max(text_left),
+                        top: screen_y,
+                        right: screen_right,
+                        bottom: screen_y + 1,
+                    };
+
+                    // Skip empty or invalid rectangles.
+                    if rect.left >= rect.right {
+                        continue;
+                    }
+
+                    if let Some(color) = color {
+                        fb.blend_fg(rect, fb.indexed(color));
+                    }
+                    if let Some(attr) = attr {
+                        fb.replace_attr(rect, Attributes::All, attr);
+                    }
+                }
+            }
+        }
     }
 
     pub fn cut(&mut self, clipboard: &mut Clipboard) {
@@ -2075,8 +2265,17 @@ impl TextBuffer {
         clipboard.write_was_line_copy(line_copy);
     }
 
-    pub fn paste(&mut self, clipboard: &Clipboard) {
+    pub fn paste(&mut self, clipboard: &Clipboard, single_line: bool) {
         let data = clipboard.read();
+
+        let data = if single_line {
+            // Can't use `unicode::newlines_forward` because bracketed paste uses CR instead of LF/CRLF.
+            let off = memchr2(b'\r', b'\n', data, 0);
+            unicode::strip_newline(&data[..off])
+        } else {
+            data
+        };
+
         if data.is_empty() {
             return;
         }
@@ -2161,7 +2360,7 @@ impl TextBuffer {
                 // Now replace tabs with spaces.
                 while line_off < line.len() && line[line_off] == b'\t' {
                     let spaces = self.tab_size_eval(self.cursor.column);
-                    let spaces = &TAB_WHITESPACE.as_bytes()[..spaces as usize];
+                    let spaces = &TAB_WHITESPACE[..spaces as usize];
                     self.edit_write(spaces);
                     line_off += 1;
                 }
@@ -2258,7 +2457,8 @@ impl TextBuffer {
         {
             let cursor = self.cursor;
             self.edit_write(if self.newlines_are_crlf { b"\r\n" } else { b"\n" });
-            self.set_cursor_internal(cursor);
+            // Can't use `set_cursor_internal` here, because we haven't updated the line stats yet.
+            self.cursor = cursor;
         }
 
         self.edit_end();
@@ -2330,7 +2530,11 @@ impl TextBuffer {
 
         self.edit_begin_grouping();
 
-        for y in selection_beg.y.min(selection_end.y)..=selection_beg.y.max(selection_end.y) {
+        let [first, last] = minmax(selection_beg, selection_end);
+        // Just like in VS Code, if the selections ends at a line start, it is not included.
+        let last_y = if last.x == 0 && last.y > first.y { last.y - 1 } else { last.y };
+
+        for y in first.y..=last_y {
             self.cursor_move_to_logical(Point { x: 0, y });
 
             let line_start_offset = self.cursor.offset;
@@ -2388,7 +2592,7 @@ impl TextBuffer {
         let mut chars = 0;
         let mut columns = 0;
 
-        'outer: loop {
+        'outer: while columns < max_columns {
             let chunk = self.read_forward(offset);
             if chunk.is_empty() {
                 break;
@@ -2408,15 +2612,65 @@ impl TextBuffer {
             }
 
             offset += chunk.len();
-
-            // No need to do another round if we
-            // already got the exact right amount.
-            if columns >= max_columns {
-                break;
-            }
         }
 
         (chars, columns)
+    }
+
+    /// This is basically the backspace operation, the way editors typically want it:
+    /// It unindents the line if the cursor is within the leading indentation.
+    pub fn backspace_with_auto_unindent(&mut self, granularity: CursorMovement) {
+        'unindent: {
+            // If there's a selection backspace deletes it.
+            if self.selection.is_some() {
+                break 'unindent;
+            }
+
+            // If we're at a line start backspace deletes the newline.
+            if self.cursor.logical_pos.x <= 0 {
+                break 'unindent;
+            }
+
+            let line_start = self.goto_line_start(self.cursor, self.cursor.logical_pos.y);
+
+            // Determine the position of the new (reduced) indentation.
+            // For Backspace (Grapheme) it's one "tab", but for Ctrl+Backspace (Word) it's to the line start.
+            let prev_column = if granularity == CursorMovement::Grapheme {
+                self.tab_size_prev_column(self.cursor.column)
+            } else {
+                0 // Ctrl+Backspace (Word) = line start
+            };
+            let (from_pos, from_col) = self.measure_indent_internal(line_start.offset, prev_column);
+
+            // Check if the cursor is within the leading indentation.
+            // This continues the measurement where we left off, so there's some extra arithmetic involved.
+            let (delta, _) = self.measure_indent_internal(
+                line_start.offset + from_pos as usize,
+                self.cursor.column - from_col,
+            );
+            if delta + from_pos < self.cursor.logical_pos.x {
+                break 'unindent;
+            }
+
+            // Here would technically just do `self.delete(CursorMovement::Grapheme, -delta);`
+            // but since we already got the `line_start`, etc., this is a bit more straightforward.
+            let to = self.cursor;
+            let from = if granularity == CursorMovement::Grapheme {
+                self.cursor_move_to_logical_internal(
+                    line_start,
+                    Point { x: from_pos, y: line_start.logical_pos.y },
+                )
+            } else {
+                line_start
+            };
+            self.edit_begin(HistoryType::Delete, from);
+            self.edit_delete(to);
+            self.edit_end();
+            return;
+        }
+
+        // If we didn't perform an unindent, fall back to a regular backspace.
+        self.delete(granularity, -1);
     }
 
     /// Displaces the current, cursor or the selection, line(s) in the given direction.
@@ -2514,7 +2768,7 @@ impl TextBuffer {
     }
 
     /// Extracts the contents of the current selection the user made.
-    /// This differs from [`TextBuffer::extract_selection()`] in that
+    /// This differs from `TextBuffer::extract_selection()` in that
     /// it does nothing if the selection was made by searching.
     pub fn extract_user_selection(&mut self, delete: bool) -> Option<Vec<u8>> {
         if !self.has_selection() {
@@ -2614,6 +2868,7 @@ impl TextBuffer {
         }
 
         self.active_edit_off = cursor.offset;
+        self.highlighter_cache.invalidate_from(cursor.logical_pos.y);
 
         // If word-wrap is enabled, the visual layout of all logical lines affected by the write
         // may have changed. This includes even text before the insertion point up to the line
@@ -2862,6 +3117,8 @@ impl TextBuffer {
             return;
         }
 
+        self.highlighter_cache.invalidate_from(damage_start);
+
         if entry_buffer_generation.is_some() {
             self.recalc_after_content_changed();
         }
@@ -2914,4 +3171,52 @@ fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SearchOptions, TextBuffer};
+
+    fn buffer_contents(buf: &mut TextBuffer) -> String {
+        let mut str = String::new();
+        buf.save_as_string(&mut str);
+        str
+    }
+
+    #[test]
+    fn replace_one_zero_width() {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.set_insert_final_newline(true);
+        buf.write_raw(b"a\nb\n");
+        buf.cursor_move_to_logical(Default::default());
+
+        for _ in 0..6 {
+            buf.find_and_replace(
+                "$",
+                SearchOptions { use_regex: true, ..Default::default() },
+                b"x",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(buffer_contents(&mut buf), "axx\nbxx\nx\n");
+    }
+
+    #[test]
+    fn replace_all_zero_width() {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.set_insert_final_newline(true);
+        buf.write_raw(b"a\nb\n");
+
+        buf.find_and_replace_all(
+            "$",
+            SearchOptions { use_regex: true, ..Default::default() },
+            b"x",
+        )
+        .unwrap();
+
+        assert_eq!(buffer_contents(&mut buf), "ax\nbx\nx\n");
+    }
 }

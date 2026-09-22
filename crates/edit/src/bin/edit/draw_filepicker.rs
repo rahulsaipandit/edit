@@ -5,13 +5,13 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use edit::arena::scratch_arena;
+use edit::collections::BVec;
 use edit::framebuffer::IndexedColor;
 use edit::helpers::*;
 use edit::input::{kbmod, vk};
 use edit::tui::*;
 use edit::{icu, path};
-use stdext::arena::scratch_arena;
-use stdext::collections::BVec;
 
 use crate::localization::*;
 use crate::state::*;
@@ -345,14 +345,7 @@ fn draw_dialog_saveas_refresh_files(state: &mut State) {
         entries.sort_unstable_by(|a, b| {
             let a = a.as_bytes();
             let b = b.as_bytes();
-
-            let a_is_dir = a.last() == Some(&b'/');
-            let b_is_dir = b.last() == Some(&b'/');
-
-            match b_is_dir.cmp(&a_is_dir) {
-                Ordering::Equal => icu::compare_strings(a, b),
-                other => other,
-            }
+            icu::compare_strings(a, b)
         });
     }
 

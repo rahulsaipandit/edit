@@ -16,18 +16,33 @@ enum TargetOs {
 }
 
 fn main() {
-    stdext::arena::init(128 * 1024 * 1024).unwrap();
-
     let target_os = match env_opt("CARGO_CFG_TARGET_OS").as_str() {
         "windows" => TargetOs::Windows,
         "macos" | "ios" => TargetOs::MacOS,
         _ => TargetOs::Unix,
     };
 
+    compile_lsh();
     compile_i18n();
     configure_icu(target_os);
     #[cfg(windows)]
     configure_windows_binary(target_os);
+}
+
+fn compile_lsh() {
+    let lsh_path = lsh::compiler::builtin_definitions_path();
+    let out_dir = env_opt("OUT_DIR");
+    let out_path = format!("{out_dir}/lsh_definitions.rs");
+
+    let mut generator = lsh::compiler::Generator::new();
+    match generator.read_directory(lsh_path).and_then(|_| generator.generate_rust()) {
+        Ok(c) => std::fs::write(out_path, c).unwrap(),
+        Err(err) => {
+            panic!("failed to compile lsh definitions: {err}");
+        }
+    };
+
+    println!("cargo::rerun-if-changed={}", lsh_path.display());
 }
 
 fn compile_i18n() {

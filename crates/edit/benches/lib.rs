@@ -3,14 +3,17 @@
 
 use std::hint::black_box;
 use std::io::Cursor;
+use std::path::Path;
 use std::{mem, vec};
 
+use ::lsh::glob;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use edit::arena::{self, scratch_arena};
+use edit::collections::BVec;
+use edit::float::parse_f64_approx;
 use edit::helpers::*;
-use edit::{buffer, glob, hash, json, oklab, simd, unicode};
-use stdext::arena::{self, scratch_arena};
-use stdext::collections::BVec;
-use stdext::unicode::Utf8Chars;
+use edit::unicode::Utf8Chars;
+use edit::{buffer, hash, json, lsh, oklab, simd, unicode};
 
 struct EditingTracePatch<'a>(usize, usize, &'a str);
 
@@ -135,6 +138,13 @@ fn bench_buffer(c: &mut Criterion) {
         });
 }
 
+fn bench_float(c: &mut Criterion) {
+    c.benchmark_group("float::parse_f64_approx")
+        .bench_function("123", |b| b.iter(|| parse_f64_approx(black_box(b"123"))))
+        .bench_function("123.456", |b| b.iter(|| parse_f64_approx(black_box(b"123.456"))))
+        .bench_function("123.456e3", |b| b.iter(|| parse_f64_approx(black_box(b"123.456e3"))));
+}
+
 fn bench_glob(c: &mut Criterion) {
     // Same benchmark as in glob-match
     const PATH: &str = "foo/bar/foo/bar/foo/bar/foo/bar/foo/bar.txt";
@@ -178,15 +188,43 @@ fn bench_json(c: &mut Criterion) {
     );
 }
 
+fn bench_lsh(c: &mut Criterion) {
+    let bytes = include_bytes!("../../../assets/highlighting-tests/markdown.md");
+    let bytes = &bytes[..];
+    let lang = lsh::LANGUAGES.iter().find(|lang| lang.id == "markdown").unwrap();
+    let highlighter = lsh::Highlighter::new(black_box(&bytes), lang);
+
+    c.benchmark_group("lsh").throughput(Throughput::Bytes(bytes.len() as u64)).bench_function(
+        "markdown",
+        |b| {
+            b.iter(|| {
+                let mut h = highlighter.clone();
+                loop {
+                    let scratch = scratch_arena(None);
+                    let res = h.parse_next_line(&scratch);
+                    if res.is_empty() {
+                        break;
+                    }
+                }
+            })
+        },
+    );
+
+    c.benchmark_group("lsh").bench_function("process_file_associations", |b| {
+        let path = Path::new("/some/long/path/to/file/foo.bar.foo.bar.foo.bar");
+        b.iter(|| lsh::process_file_associations(lsh::FILE_ASSOCIATIONS, black_box(path)))
+    });
+}
+
 fn bench_oklab(c: &mut Criterion) {
     c.benchmark_group("oklab")
         .bench_function("StraightRgba::as_oklab", |b| {
-            b.iter(|| black_box(oklab::StraightRgba::from_le(0xff212cbe)).as_oklab())
+            b.iter(|| black_box(oklab::StraightRgba::from_rgba(0xbe2c21ff)).as_oklab())
         })
         .bench_function("StraightRgba::oklab_blend", |b| {
             b.iter(|| {
-                black_box(oklab::StraightRgba::from_le(0x7f212cbe))
-                    .oklab_blend(black_box(oklab::StraightRgba::from_le(0x7f3aae3f)))
+                black_box(oklab::StraightRgba::from_rgba(0xbe2c217f))
+                    .oklab_blend(black_box(oklab::StraightRgba::from_rgba(0x3fae3a7f)))
             })
         });
 }
@@ -241,7 +279,7 @@ fn bench_simd_memset<T: Copy + Default>(c: &mut Criterion) {
             &bytes,
             |b, &bytes| {
                 let slice = unsafe { buf.get_unchecked_mut(..bytes / size) };
-                b.iter(|| stdext::simd::memset(black_box(slice), Default::default()));
+                b.iter(|| edit::simd::memset(black_box(slice), Default::default()));
             },
         );
     }
@@ -281,9 +319,11 @@ fn bench(c: &mut Criterion) {
     arena::init(128 * MEBI).unwrap();
 
     bench_buffer(c);
+    bench_float(c);
     bench_glob(c);
     bench_hash(c);
     bench_json(c);
+    bench_lsh(c);
     bench_oklab(c);
     bench_simd_lines_fwd(c);
     bench_simd_memchr2(c);

@@ -3,8 +3,8 @@
 
 //! Base64 facilities.
 
-use stdext::arena::Arena;
-use stdext::collections::BString;
+use crate::arena::Arena;
+use crate::collections::BString;
 
 const CHARSET: [u8; 64] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -36,7 +36,7 @@ pub fn encode<'a>(arena: &'a Arena, dst: &mut BString<'a>, src: &[u8]) {
                 // SAFETY: Thanks to `remaining > 3`, reading 4 bytes at once is safe.
                 // This improves performance massively over a byte-by-byte approach,
                 // because it allows us to byte-swap the read and use simple bit-shifts below.
-                let val = u32::from_be((inp as *const u32).read_unaligned());
+                let val = u32::from_be(inp.cast::<u32>().read_unaligned());
                 inp = inp.add(3);
                 remaining -= 3;
 
@@ -80,10 +80,9 @@ pub fn encode<'a>(arena: &'a Arena, dst: &mut BString<'a>, src: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use stdext::arena::scratch_arena;
-    use stdext::collections::BString;
-
     use super::encode;
+    use crate::arena::scratch_arena;
+    use crate::collections::BString;
 
     #[test]
     fn test_basic() {

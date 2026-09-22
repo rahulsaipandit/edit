@@ -8,19 +8,24 @@
 )]
 #![allow(clippy::missing_transmute_annotations, clippy::new_without_default, stable_features)]
 
+pub mod alloc;
+pub mod arena;
 pub mod base64;
 pub mod buffer;
 pub mod cell;
 pub mod clipboard;
+pub mod collections;
 pub mod document;
+pub mod float;
 pub mod framebuffer;
 pub mod fuzzy;
-pub mod glob;
 pub mod hash;
 pub mod helpers;
 pub mod icu;
 pub mod input;
 pub mod json;
+pub mod lsh;
+pub mod maybe_owned;
 pub mod oklab;
 pub mod path;
 pub mod simd;

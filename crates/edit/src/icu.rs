@@ -8,15 +8,14 @@ use std::ffi::{CStr, c_char};
 use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
 use std::{fmt, mem};
 
-use stdext::arena::{Arena, scratch_arena};
-use stdext::arena_format;
-use stdext::collections::{BString, BVec};
-use stdext::unicode::Utf8Chars;
-
+use crate::arena::{Arena, arena_format, scratch_arena};
 use crate::buffer::TextBuffer;
+use crate::collections::{BString, BVec};
 use crate::sys;
+use crate::unicode::Utf8Chars;
 
 pub(crate) const ILLEGAL_ARGUMENT_ERROR: Error = Error(1); // U_ILLEGAL_ARGUMENT_ERROR
 pub const ICU_MISSING_ERROR: Error = Error(0);
@@ -103,7 +102,7 @@ pub fn get_available_encodings() -> &'static Encodings {
                     let mut status = icu_ffi::U_ZERO_ERROR;
                     let mime = (f.ucnv_getStandardName)(
                         name.as_ptr(),
-                        c"MIME".as_ptr() as *const _,
+                        c"MIME".as_ptr().cast(),
                         &mut status,
                     );
                     if !mime.is_null() && status.is_success() {
@@ -182,7 +181,7 @@ impl<'pivot> Converter<'pivot> {
             return Err(status.as_error());
         }
 
-        let pivot_source = pivot_buffer.as_mut_ptr() as *mut u16;
+        let pivot_source = pivot_buffer.as_mut_ptr().cast::<u16>();
         let pivot_target = unsafe { pivot_source.add(pivot_buffer.len()) };
 
         Ok(Self { source, target, pivot_buffer, pivot_source, pivot_target, reset: true })
@@ -217,11 +216,11 @@ impl<'pivot> Converter<'pivot> {
         let input_end = unsafe { input_beg.add(input.len()) };
         let mut input_ptr = input_beg;
 
-        let output_beg = output.as_mut_ptr() as *mut u8;
+        let output_beg = output.as_mut_ptr().cast::<u8>();
         let output_end = unsafe { output_beg.add(output.len()) };
         let mut output_ptr = output_beg;
 
-        let pivot_beg = self.pivot_buffer.as_mut_ptr() as *mut u16;
+        let pivot_beg = self.pivot_buffer.as_mut_ptr().cast::<u16>();
         let pivot_end = unsafe { pivot_beg.add(self.pivot_buffer.len()) };
 
         let flush = input.is_empty();
@@ -359,7 +358,7 @@ fn text_buffer_from_utext<'a>(ut: &icu_ffi::UText) -> &'a TextBuffer {
 }
 
 fn double_cache_from_utext<'a>(ut: &icu_ffi::UText) -> &'a mut DoubleCache {
-    unsafe { &mut *(ut.p_extra as *mut DoubleCache) }
+    unsafe { &mut *ut.p_extra.cast() }
 }
 
 extern "C" fn utext_clone(
@@ -743,6 +742,27 @@ pub fn compare_strings(a: &[u8], b: &[u8]) -> Ordering {
             if let Ok(f) = init_if_needed() {
                 let mut status = icu_ffi::U_ZERO_ERROR;
                 coll = (f.ucol_open)(c"".as_ptr(), &mut status);
+                // Turns on Unicode normalization. I'm not 100% sure if it's needed, but it only has a
+                // small-ish performance impact and sounds like it's required for correct filename sorting.
+                (f.ucol_setAttribute)(
+                    coll,
+                    icu_ffi::UCOL_NORMALIZATION_MODE,
+                    icu_ffi::UCOL_ON,
+                    &mut status,
+                );
+                // Ensure that "file2" < "file10", even though '2' > '1'.
+                // NOTE: This has a _huge_ performance impact. It's roughly 5x slower for our purpose of
+                // sorting filenames. If it becomes an issue, we could use `ucol_getSortKey` (only +25%).
+                // (`ucol_strcollUTF8` is faster if `UCOL_NUMERIC_COLLATION` isn't used.)
+                (f.ucol_setAttribute)(
+                    coll,
+                    icu_ffi::UCOL_NUMERIC_COLLATION,
+                    icu_ffi::UCOL_ON,
+                    &mut status,
+                );
+                if status.is_failure() {
+                    coll = null_mut();
+                }
             }
 
             ROOT_COLLATOR = Some(coll);
@@ -792,13 +812,15 @@ fn compare_strings_ascii(a: &[u8], b: &[u8]) -> Ordering {
     // case-insensitive equal, because then we use that as a fallback.
     while let Some((&a, &b)) = iter.next() {
         if a != b {
-            let mut order = a.cmp(&b);
             let la = a.to_ascii_lowercase();
             let lb = b.to_ascii_lowercase();
+            let mut order = la.cmp(&lb);
 
-            if la == lb {
-                // High weight: Find the first character which
-                // differs case-insensitively.
+            if order == Ordering::Equal {
+                // High weight: Find the first character which differs case-insensitively.
+                // Otherwise, it falls back to (or rather: defaults to) a case-sensitive comparison.
+                order = a.cmp(&b);
+
                 for (a, b) in iter {
                     let la = a.to_ascii_lowercase();
                     let lb = b.to_ascii_lowercase();
@@ -853,9 +875,9 @@ pub fn fold_case<'a>(arena: &'a Arena, input: &str) -> BString<'a> {
             output_len = unsafe {
                 (f.ucasemap_utf8FoldCase)(
                     casemap,
-                    output.as_mut_ptr() as *mut _,
+                    output.as_mut_ptr().cast(),
                     output.len() as i32,
-                    input.as_ptr() as *const _,
+                    input.as_ptr().cast(),
                     input.len() as i32,
                     &mut status,
                 )
@@ -869,9 +891,9 @@ pub fn fold_case<'a>(arena: &'a Arena, input: &str) -> BString<'a> {
             output_len = unsafe {
                 (f.ucasemap_utf8FoldCase)(
                     casemap,
-                    output.as_mut_ptr() as *mut _,
+                    output.as_mut_ptr().cast(),
                     output.len() as i32,
-                    input.as_ptr() as *const _,
+                    input.as_ptr().cast(),
                     input.len() as i32,
                     &mut status,
                 )
@@ -921,6 +943,7 @@ struct LibraryFunctions {
 
     // LIBICUI18N_PROC_NAMES
     ucol_open: icu_ffi::ucol_open,
+    ucol_setAttribute: icu_ffi::ucol_setAttribute,
     ucol_strcollUTF8: icu_ffi::ucol_strcollUTF8,
     uregex_open: icu_ffi::uregex_open,
     uregex_close: icu_ffi::uregex_close,
@@ -936,7 +959,8 @@ struct LibraryFunctions {
 macro_rules! proc_name {
     ($s:literal) => {
         concat!(env!("EDIT_CFG_ICU_EXPORT_PREFIX"), $s, env!("EDIT_CFG_ICU_EXPORT_SUFFIX"), "\0")
-            .as_ptr() as *const c_char
+            .as_ptr()
+            .cast()
     };
 }
 
@@ -955,8 +979,9 @@ const LIBICUUC_PROC_NAMES: [*const c_char; 10] = [
 ];
 
 // Found in libicui18n.so on UNIX, icuin.dll/icu.dll on Windows.
-const LIBICUI18N_PROC_NAMES: [*const c_char; 11] = [
+const LIBICUI18N_PROC_NAMES: [*const c_char; 12] = [
     proc_name!("ucol_open"),
+    proc_name!("ucol_setAttribute"),
     proc_name!("ucol_strcollUTF8"),
     proc_name!("uregex_open"),
     proc_name!("uregex_close"),
@@ -969,28 +994,18 @@ const LIBICUI18N_PROC_NAMES: [*const c_char; 11] = [
     proc_name!("uregex_end64"),
 ];
 
-enum LibraryFunctionsState {
-    Uninitialized,
-    Failed,
-    Loaded(LibraryFunctions),
-}
-
-static mut LIBRARY_FUNCTIONS: LibraryFunctionsState = LibraryFunctionsState::Uninitialized;
+static LIBRARY_FUNCTIONS: OnceLock<Option<LibraryFunctions>> = OnceLock::new();
 
 pub fn init() -> Result<()> {
     init_if_needed()?;
     Ok(())
 }
 
-#[allow(static_mut_refs)]
 fn init_if_needed() -> Result<&'static LibraryFunctions> {
-    #[cold]
-    fn load() {
+    fn load() -> Option<LibraryFunctions> {
         unsafe {
-            LIBRARY_FUNCTIONS = LibraryFunctionsState::Failed;
-
             let Ok(icu) = sys::load_icu() else {
-                return;
+                return None;
             };
 
             type TransparentFunction = unsafe extern "C" fn() -> *const ();
@@ -1011,7 +1026,7 @@ fn init_if_needed() -> Result<&'static LibraryFunctions> {
             );
 
             let mut funcs = MaybeUninit::<LibraryFunctions>::uninit();
-            let mut ptr = funcs.as_mut_ptr() as *mut TransparentFunction;
+            let mut ptr = funcs.as_mut_ptr().cast::<TransparentFunction>();
 
             #[cfg(edit_icu_renaming_auto_detect)]
             let scratch_outer = scratch_arena(None);
@@ -1034,7 +1049,7 @@ fn init_if_needed() -> Result<&'static LibraryFunctions> {
                             "Failed to load ICU function: {:?}",
                             CStr::from_ptr(name)
                         );
-                        return;
+                        return None;
                     };
 
                     ptr.write(func);
@@ -1042,27 +1057,20 @@ fn init_if_needed() -> Result<&'static LibraryFunctions> {
                 }
             }
 
-            LIBRARY_FUNCTIONS = LibraryFunctionsState::Loaded(funcs.assume_init());
+            Some(funcs.assume_init())
         }
     }
 
-    unsafe {
-        if matches!(&LIBRARY_FUNCTIONS, LibraryFunctionsState::Uninitialized) {
-            load();
-        }
-    }
-
-    match unsafe { &LIBRARY_FUNCTIONS } {
-        LibraryFunctionsState::Loaded(f) => Ok(f),
-        _ => Err(ICU_MISSING_ERROR),
+    match LIBRARY_FUNCTIONS.get_or_init(load) {
+        Some(f) => Ok(f),
+        None => Err(ICU_MISSING_ERROR),
     }
 }
 
-#[allow(static_mut_refs)]
 fn assume_loaded() -> &'static LibraryFunctions {
-    match unsafe { &LIBRARY_FUNCTIONS } {
-        LibraryFunctionsState::Loaded(f) => f,
-        _ => unreachable!(),
+    match LIBRARY_FUNCTIONS.get() {
+        Some(Some(f)) => f,
+        _ => unsafe { std::hint::unreachable_unchecked() },
     }
 }
 
@@ -1162,6 +1170,13 @@ mod icu_ffi {
 
     pub type ucol_open =
         unsafe extern "C" fn(loc: *const c_char, status: &mut UErrorCode) -> *mut UCollator;
+
+    pub type ucol_setAttribute =
+        unsafe extern "C" fn(coll: *mut UCollator, attr: i32, value: i32, status: &mut UErrorCode);
+
+    pub const UCOL_NORMALIZATION_MODE: i32 = 4;
+    pub const UCOL_NUMERIC_COLLATION: i32 = 7;
+    pub const UCOL_ON: i32 = 17;
 
     pub type ucol_strcollUTF8 = unsafe extern "C" fn(
         coll: *mut UCollator,
@@ -1347,6 +1362,9 @@ mod tests {
         assert_eq!(compare_strings_ascii(b"abcd", b"abc"), Ordering::Greater);
         // Same chars, different cases - 1st char wins
         assert_eq!(compare_strings_ascii(b"AbC", b"aBc"), Ordering::Less);
+        // Different chars, different cases
+        assert_eq!(compare_strings_ascii(b"a", b"B"), Ordering::Less);
+        assert_eq!(compare_strings_ascii(b"B", b"a"), Ordering::Greater);
         // Different chars, different cases - 2nd char wins, because it differs
         assert_eq!(compare_strings_ascii(b"hallo", b"Hello"), Ordering::Less);
         assert_eq!(compare_strings_ascii(b"Hello", b"hallo"), Ordering::Greater);
